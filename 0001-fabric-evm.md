@@ -505,3 +505,57 @@ ensure a seamless fit in the ecosystem.
 
 # Unresolved questions
 [unresolved]: #unresolved-questions
+
+# Licensing
+
+_Disclaimer: The following is a practical summary intended to highlight the main 
+consequences of LGPL v3 in this specific context. It does not constitute legal 
+advice._
+
+This project depends on the 
+[go-ethereum](https://github.com/ethereum/go-ethereum/) repository in order to 
+achieve and maintain compatibility with the Ethereum ecosystem, including 
+faithful execution of Ethereum Virtual Machine (EVM) semantics and alignment 
+with upstream protocol updates. Parts of the go-ethereum codebase are licensed 
+under the **GNU Lesser General Public License, version 3 (LGPL v3)**. As a 
+result, the use of go-ethereum as a dependency has licensing implications for 
+this project and for any downstream users.
+
+## Practical consequences of LGPL v3 in Go
+
+In languages such as Go, static linking is effectively the only available option 
+in practice. Unlike environments that support shared libraries with stable ABI 
+boundaries, Go binaries typically include all dependencies at link time. From an 
+LGPL v3 perspective, this means that:
+
+- Statically linking against LGPL v3-licensed code generally causes the 
+resulting binary to be considered a combined work.
+- Distributing such a binary therefore triggers LGPL v3 obligations, including 
+the requirement that the combined work be made available under terms compatible 
+with LGPL v3.
+
+Given these constraints, this project explicitly adopts LGPL v3 compatibility as 
+a conscious design and licensing choice. The source code of this repository is 
+made available in a way that satisfies the LGPL v3 requirements inherited 
+through the go-ethereum dependency.
+
+## Implications for downstream users
+
+Anyone using, modifying, or redistributing this repository should be aware of 
+the following implications:
+
+- If you link statically to this repository (which is the default and typical 
+case in Go), your resulting work is subject to the obligations of the LGPL v3. 
+In practice, this means that you must also distribute your combined work under 
+terms compatible with LGPL v3.
+- If you wish to avoid these obligations, you must ensure dynamic linking at a 
+suitable boundary (for example, by interacting with this project as a separate 
+service or process rather than linking it directly as a Go dependency).
+- Any redistribution of binaries derived from this repository must comply with 
+the LGPL v3, including providing access to corresponding source code and 
+preserving applicable license notices.
+
+In short, compatibility with Ethereum via go-ethereum comes with deliberate 
+licensing trade-offs. This project embraces those trade-offs transparently, and 
+downstream users must take them into account when integrating or redistributing 
+this code.
