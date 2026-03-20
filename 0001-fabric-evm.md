@@ -7,7 +7,7 @@ nav_order: 3
 - Feature Name: Ethereum compatibility
 - Start Date: 2025-11-26
 - RFC PR: (leave this empty)
-- Fabric-X Component: Fabric-X Endorser
+- Fabric-X Component: fabric-x-evm
 - Fabric-X Issue: (leave this empty)
 
 # Summary
