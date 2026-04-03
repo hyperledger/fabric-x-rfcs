@@ -136,9 +136,8 @@ input to the migration process.
 
 ## Step 2: Export to the Canonical Data Set
 
-The `fabric-x-migrate export` command reads the Fabric snapshot directory and
-produces the **canonical data set** — a self-contained, verifiable artifact that
-represents all the state needed to initialize a Fabric-X committer.
+Run the exporter, pointing it at the snapshot directory and a destination for
+the output:
 
 ```bash
 fabric-x-migrate export \
@@ -146,55 +145,56 @@ fabric-x-migrate export \
   --output-dir /tmp/migration-data
 ```
 
-During export, the tool:
+The tool starts by verifying that the snapshot files haven't been tampered with
+or corrupted in transit — it computes SHA-256 hashes and checks them against
+what's recorded in `_snapshot_signable_metadata.json`. If anything doesn't
+match, it stops immediately.
 
-- **Verifies snapshot integrity** by computing SHA-256 hashes of snapshot files
-  and comparing them against the hashes in `_snapshot_signable_metadata.json`.
-- **Includes public state**: all key-value pairs from user-defined chaincode
-  namespaces, with their MVCC versions converted to Fabric-X's scalar format.
-- **Excludes private data hashes**: Fabric snapshots store hashed
-  representations of private data collections under namespaces with the pattern
-  `<chaincode>$$h$$<collection>` (where `$$` is the namespace joiner and `h`
-  is the hash data prefix). These are irrelevant to Fabric-X and are filtered
-  out entirely. The tool logs each excluded collection so operators have a
-  complete record of what was skipped.
-- **Excludes collection config history**: The `collection_config.data` file in
-  the snapshot contains the history of PDC configurations. Since Fabric-X does
-  not support PDCs, this file is ignored.
-- **Excludes system chaincodes**: Internal Fabric namespaces (`_lifecycle`,
-  `lscc`, `qscc`, `cscc`, `escc`, `vscc`) serve Fabric-internal functions
-  (lifecycle management, ledger queries, endorsement/validation system
-  chaincodes) that have no equivalent in Fabric-X. These are filtered out.
-- **Handles transaction IDs**: See the dedicated section below on why
-  transaction ID history is not migrated.
+Then it walks through the snapshot namespace by namespace. User-defined chaincode
+state (the actual application data) goes into the output. Everything else gets
+filtered out:
 
-The output is a directory containing namespace state files, policy files, and a
-manifest with checksums. This is the canonical data set.
+- Private data collection hashes sit under namespaces like
+  `mycc$$h$$secretCollection` — they're hashes of data that Fabric-X doesn't
+  have, so there's nothing useful to import. The exporter logs every one it
+  skips so you have a clear record.
+- `collection_config.data` holds the history of PDC configurations. Ignored
+  completely.
+- System chaincodes — `_lifecycle`, `lscc`, `qscc`, `cscc`, `escc`, `vscc` —
+  are Fabric internals with no Fabric-X equivalent. They don't come across.
+- Transaction ID history is intentionally left out. There's a dedicated section
+  below explaining the reasoning.
+
+MVCC versions get converted from Fabric's `(BlockNum, TxNum)` pairs to the
+scalar integers Fabric-X uses, and any CouchDB internal index keys get stripped
+if the source peer was running CouchDB.
+
+The output is a directory of namespace state files and endorsement policy files,
+tied together by a manifest that records SHA-256 checksums for everything. That
+directory is the canonical data set.
 
 ## Step 3: Bootstrap the Committer
-
-The Fabric-X committer gains a new one-time startup mode:
 
 ```bash
 committer --init-from-snapshot /tmp/migration-data
 ```
 
-When started with this flag, the committer reads the canonical data set and
-bulk-loads the state into its PostgreSQL/YugabyteDB database using the COPY
-protocol for high throughput. It creates the schema, populates each namespace
-table, registers endorsement policies, sets the block height, and then
-transitions to normal operation.
+This flag puts the committer into bootstrap mode before it starts any of its
+normal gRPC services. It reads the canonical data set, creates the database
+schema, and bulk-loads all the namespace state using PostgreSQL's COPY
+protocol — which is orders of magnitude faster than row-at-a-time inserts for
+the kind of data volumes we're dealing with. Endorsement policies get
+registered, the block height gets set to the snapshot's block number, and then
+the committer transitions to normal operation from that point.
 
-This procedure is a **one-time operation** for a new, empty database. If the
-database already contains committed state (i.e., the metadata table has a
-non-null `last committed block number`), the committer refuses to proceed and
-exits with an error. This guard prevents accidental re-initialization of a
-running network.
+One important constraint: this is a one-time operation on an empty database.
+If the committer finds that the metadata table already has a committed block
+number, it stops and tells you. It won't touch an existing network's state.
 
 ## Step 4: Verify the Migration
 
-The `fabric-x-migrate verify` command connects to the bootstrapped committer's
-database and confirms that the imported state matches the canonical data set:
+Before letting the committer process real transactions, verify that what ended
+up in the database matches what was exported:
 
 ```bash
 fabric-x-migrate verify \
@@ -204,48 +204,36 @@ fabric-x-migrate verify \
   --db-user admin
 ```
 
-Verification checks:
-- Row counts for every namespace match the manifest.
-- The stored block height matches the snapshot block number.
-- SHA-256 checksums of the imported state match the checksums recorded in the
-  manifest (computed during export).
+The verifier checks row counts per namespace against the manifest, confirms the
+block height is correct, and validates that endorsement policies are registered.
+With `--deep` it also samples individual key-value pairs and compares them
+against the canonical data set files. Don't route production traffic until this
+passes.
 
-Only after verification succeeds should the operator allow the committer to
-start accepting new transactions.
+## Transaction ID History: Why We're Not Migrating It
 
-## Transaction ID History: Decision Not to Migrate
+Fabric snapshots include `txids.data` — a sorted list of every transaction ID
+committed up to the snapshot block. Fabric uses this to block replays: if a
+peer sees a transaction ID it's already processed, it rejects it.
 
-A Fabric snapshot includes `txids.data`, a sorted list of all transaction IDs
-committed up to the snapshot block height. In Fabric, this is used to prevent
-replay attacks: if a peer receives a transaction with a previously seen ID, it
-rejects it.
+We're not migrating this history, and the reason is straightforward: a Fabric
+transaction physically cannot be replayed on Fabric-X. The two platforms use
+completely different transaction envelope formats, different signature schemes,
+different endorsement structures. An old Fabric transaction would fail
+parsing before it got anywhere near the MVCC check. On top of that, Fabric
+derives transaction IDs from `SHA256(nonce || creator)` while Fabric-X uses
+a different scheme — the ID spaces don't overlap.
 
-For the Fabric-to-Fabric-X migration, we do **not** migrate transaction ID
-history. The reasoning is as follows:
+So the replay risk that `txids.data` guards against in Fabric simply doesn't
+exist in a cross-platform context. This matches the conclusion from the
+[community discussion on issue #21](https://github.com/hyperledger/fabric-x/issues/21).
+That said, this should be validated by a security expert before the feature
+is called stable — it's the kind of reasoning that benefits from a second
+pair of eyes.
 
-- **Different transaction formats**: Fabric and Fabric-X use fundamentally
-  different transaction envelope structures. A Fabric transaction cannot be
-  replayed on Fabric-X because the committer would fail to parse or validate it.
-  The cryptographic signatures, endorsement structures, and payload formats are
-  incompatible.
-- **Different ID derivation**: Fabric transaction IDs are derived from
-  `SHA256(nonce || creator)`. Fabric-X uses its own transaction identification
-  scheme. There is no overlap in the ID space.
-- **No practical attack vector**: An attacker cannot take a historical Fabric
-  transaction and submit it to a Fabric-X network because the transaction would
-  not pass signature verification, endorsement policy checks, or payload
-  parsing. The risk of a replay attack across the two platforms is not present.
-
-This aligns with the assessment in the
-[community discussion](https://github.com/hyperledger/fabric-x/issues/21)
-where it was noted that "there's no apparent risk of a replication attack because
-the transaction formats differ." That said, this assumption should be confirmed
-with a security review before the feature is considered stable.
-
-If future analysis identifies a scenario where TX-ID migration is necessary, the
-canonical data set format is extensible — a `txids` section can be added to the
-manifest and a corresponding file included in the artifact without breaking
-existing tooling.
+If that review turns up a scenario we haven't thought of, the canonical data
+set format can accommodate a `txids` section without breaking anything — it's
+just not populated by default.
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
@@ -999,70 +987,67 @@ post-migration verification step before routing production traffic.
 # Security considerations
 [security]: #security-considerations
 
-Migration involves transferring the entire world state of a production
-blockchain network. The security of this process must be treated with the same
-rigor as the security of the network itself.
+You're moving the entire world state of a production blockchain. The security
+bar here should be at least as high as the security of the network itself.
 
 ## Snapshot Trust and Provenance
 
-The Fabric snapshot is the root of trust for the entire migration. If the
-snapshot is tampered with, the Fabric-X network will start with corrupted state.
+The Fabric snapshot is where everything starts. If it's been tampered with,
+every downstream step produces a corrupted result — and you won't necessarily
+know until something breaks in production.
 
-- **Snapshot source**: The snapshot must be taken from a trusted peer. In a
-  multi-organization network, each organization should independently take a
-  snapshot from their own peer and compare the
-  `_snapshot_signable_metadata.json` hashes across organizations. If the hashes
-  match, the snapshots are consistent. If they do not, there is a ledger
-  divergence that must be investigated before migration.
-- **Integrity chain**: The exporter verifies snapshot file hashes against
-  `_snapshot_signable_metadata.json` before processing. The canonical data set
-  manifest records the `snapshot_signable_metadata_hash` to tie the export back
-  to the original snapshot. The verification tool then confirms the database
-  state matches the canonical data set. This creates a three-link integrity
-  chain: snapshot → canonical data set → database.
-- **Snapshot transfer**: If the snapshot is transferred between machines (e.g.,
-  from the Fabric peer to the machine running the exporter), standard secure
-  transfer practices apply (SCP, encrypted volumes, checksums). The exporter's
-  integrity verification will detect corruption during transfer.
+The exporter verifies file hashes against `_snapshot_signable_metadata.json`
+before doing anything else. This catches corruption in transit but it only
+proves the snapshot is internally consistent — it doesn't prove it came from
+a legitimate peer. In a multi-organization network, each organization should
+take a snapshot from their own peer independently and compare the
+`_snapshot_signable_metadata.json` hashes out of band. Matching hashes mean
+consistent ledger state. A mismatch means there's a divergence that needs
+investigating before migration proceeds.
+
+The integrity chain extends through the whole pipeline: the exporter records
+the snapshot's metadata hash in the manifest, and the verification tool
+confirms the database matches the canonical data set. Snapshot → canonical
+data set → database — each step is verifiable against the previous one.
 
 ## Data Confidentiality
 
-- **Canonical data set files contain plaintext state**: The `.state` files
-  contain the full key-value pairs from the Fabric world state. These files
-  should be treated as sensitive data and stored on encrypted volumes with
-  appropriate access controls.
-- **Database credentials**: The verification tool accepts database credentials
-  via command-line flags or environment variables. The `FABRIC_X_DB_PASSWORD`
-  environment variable is preferred over the `--db-password` flag to avoid
-  credential exposure in process listings and shell history.
+The `.state` files in the canonical data set contain the full, plaintext
+world state of your Fabric network. Treat them accordingly: encrypted volumes,
+restricted file permissions, and careful handling if you're moving them between
+machines.
+
+For database credentials, use the `FABRIC_X_DB_PASSWORD` environment variable
+rather than the `--db-password` flag. Flags show up in process listings and
+shell history; environment variables don't.
 
 ## Bootstrap Access Control
 
-The `--init-from-snapshot` flag gives the caller the ability to set the entire
-state of the committer's database. Access to this command must be restricted
-to authorized operators. In production environments:
+`--init-from-snapshot` is a powerful operation. It sets the entire state of
+the committer's database. Restrict access to it: the committer binary should
+only be executable by authorized system accounts, and the canonical data set
+directory should have tight file permissions.
 
-- The committer binary should only be executable by authorized system accounts.
-- The canonical data set directory should have restricted file permissions.
-- The one-time operation guard prevents accidental re-initialization, but it is
-  not a security control — it is a safety check. An attacker with database
-  access could drop and recreate the database to bypass the guard. Database
-  access itself must be secured through standard PostgreSQL/YugabyteDB access
-  controls.
+The one-time operation guard is a safety check, not a security control. Someone
+with database access could drop and recreate the database to bypass it. The
+real protection comes from securing the database itself through standard
+PostgreSQL/YugabyteDB access controls, not from the guard.
 
 ## Transaction Replay Analysis
 
-As discussed in the Transaction ID History section, Fabric transactions cannot
-be replayed on Fabric-X due to incompatible envelope formats, signature
-schemes, and payload structures. However, this analysis should be formally
-reviewed by a security expert before the migration feature is promoted to
-stable status. Specifically, the review should confirm:
+The case for not migrating transaction IDs is covered in the guide-level
+section, but to be precise about the security reasoning: a Fabric transaction
+cannot be replayed on Fabric-X because the two platforms use different envelope
+formats, different signature schemes, and different endorsement structures. The
+transaction would fail parsing or signature verification before getting anywhere
+near the committer.
 
-1. There is no way to construct a valid Fabric-X transaction from a historical
-   Fabric transaction.
-2. The transaction ID spaces of Fabric and Fabric-X are disjoint.
-3. No information in the migrated state (key-value pairs, versions, policies)
-   can be exploited to forge valid Fabric-X transactions.
+This should be formally reviewed by a security expert before the feature is
+called stable. The review should specifically confirm that (1) no historical
+Fabric transaction can be turned into a valid Fabric-X transaction, (2) the
+transaction ID spaces are disjoint, and (3) nothing in the migrated state
+(key-value pairs, versions, policies) can be exploited to forge valid
+Fabric-X transactions.
 
 # Operational considerations
 [operations]: #operational-considerations
@@ -1071,36 +1056,27 @@ This section provides practical guidance for operators planning a migration.
 
 ## Pre-Migration Checklist
 
-Before starting the migration process, operators should:
+In a multi-organization Fabric network, migration is not something one org can
+do unilaterally. All participating organizations need to agree on the block
+height for the snapshot, the timeline for quiescing the network, and how
+snapshot hashes will be compared out-of-band to confirm ledger consistency.
+The cutover procedure — when Fabric stops and Fabric-X takes over — needs to
+be communicated and agreed upon across all parties well before it happens.
 
-1. **Ensure all organizations agree on the migration plan.** In a
-   multi-organization Fabric network, all participating organizations must
-   coordinate on:
-   - The block height at which the snapshot will be taken.
-   - The timeline for quiescing the network.
-   - The process for verifying snapshot consistency across organizations.
-   - The cutover procedure (when Fabric stops and Fabric-X starts).
+The Fabric-X infrastructure also needs to be ready before bootstrap begins.
+The ordering service should be deployed and configured. The committer's
+database (PostgreSQL or YugabyteDB) should be provisioned with enough storage.
+The sidecar, coordinator, and any other required components should be wired up
+and ready — they just shouldn't be started until after the committer finishes
+its bootstrap.
 
-2. **Set up the Fabric-X infrastructure.** Before bootstrap, the following
-   must be in place:
-   - The ordering service must be deployed and configured to serve the new
-     Fabric-X network.
-   - The committer's database (PostgreSQL or YugabyteDB) must be provisioned
-     with sufficient storage.
-   - The committer sidecar, coordinator, and any other required components
-     must be configured (but not yet started — they will start after the
-     committer completes bootstrap).
-
-3. **Estimate resource requirements.** Based on the Fabric world state size:
-   - Disk space for the canonical data set (approximately equal to the
-     uncompressed world state).
-   - Database storage (2–3x the raw state size due to indexing).
-   - Import time (see Performance Characteristics above).
-
-4. **Take a test snapshot and perform a dry run.** Use `--dry-run` to preview
-   the export scope. Perform a full export and bootstrap against a test
-   database to validate the process and measure timing before attempting the
-   production migration.
+Before committing to a production migration window, run through the whole thing
+once against a test database. Take a real snapshot, run `--dry-run` to review
+what will be exported, do the full export and bootstrap, and time it. That
+test run will tell you how much storage the canonical data set needs, how long
+the import takes with your actual data volume, and whether anything in your
+environment breaks the process. The 2–3x database storage overhead relative to
+the raw state size is also worth accounting for in your provisioning plan.
 
 ## Ordering Service Coordination
 
@@ -1110,52 +1086,47 @@ normally, it calls `getNextBlockNumberToCommit()` which returns
 `snapshotBlockNumber + 1`. The committer then requests blocks starting from
 this height from the ordering service via the sidecar.
 
-This means the ordering service must be configured to produce blocks starting
-from `snapshotBlockNumber + 1`. In practice, this requires:
+This means the ordering service must be initialized to begin sequencing new
+transactions into blocks starting at the correct height. The Fabric-X network's
+initial configuration must reference the same logical starting point as the
+snapshot, and the sidecar delivery endpoint must be reachable by the committer.
 
-- The Fabric-X network's genesis / initial configuration must reference the
-  same logical starting point as the snapshot.
-- The ordering service must be initialized to begin sequencing new transactions
-  into blocks starting at the correct height.
-- The sidecar delivery endpoint must be reachable by the committer.
-
-The exact procedure for initializing the ordering service for a migrated
-network depends on the ordering service implementation and is outside the
-scope of this RFC, but it is a critical operational dependency that must be
-addressed before the committer can process new transactions.
+The exact procedure for setting this up depends on the ordering service
+implementation and is outside the scope of this RFC. But it is a critical
+operational dependency — the committer cannot process new transactions until
+this is in place, and it needs to be worked out before the production cutover.
 
 ## Rollback Strategy
 
-Migration is a one-way operation by design, but operators should plan for the
-possibility that the Fabric-X network does not behave as expected after
-migration:
+Migration is a one-way operation by design, but things can go wrong —
+configuration issues, unexpected behavior in the Fabric-X network, problems
+discovered during burn-in. The most important rule is: do not decommission
+the Fabric peers or ordering service until Fabric-X has been verified and
+running in production long enough to be confident. Keep the original Fabric
+snapshot and canonical data set on durable storage as well. If something needs
+to be redone, the export doesn't need to be repeated — just drop the database,
+create a fresh one, and re-run the bootstrap with the existing canonical data
+set.
 
-- **Keep the Fabric network intact.** Do not decommission the Fabric peers
-  or ordering service until the Fabric-X network has been verified and is
-  running successfully in production for a sufficient burn-in period.
-- **Maintain the snapshot.** Keep the original Fabric snapshot and the
-  canonical data set on durable storage. If the Fabric-X migration needs to
-  be repeated (e.g., after fixing a configuration issue), the export does not
-  need to be re-run — only the bootstrap needs to be repeated with a fresh
-  database.
-- **Application dual-write is not supported.** This migration does not
-  provide a mechanism for writing to both Fabric and Fabric-X simultaneously.
-  The cutover is atomic: at a defined point in time, applications switch from
-  Fabric to Fabric-X.
+This migration does not provide dual-write between Fabric and Fabric-X. The
+cutover is atomic: at a defined moment, applications switch from Fabric to
+Fabric-X. There is no gradual traffic splitting or parallel write mode.
 
 ## Post-Migration Checklist
 
-After bootstrap and verification succeed:
+Once bootstrap and verification pass, start the committer in normal mode and
+confirm it connects to the ordering service and sidecar. Don't route production
+traffic yet — submit a test transaction first and confirm it commits, then
+confirm the resulting state change shows up in the database. Watch the
+committer's Prometheus metrics on the monitoring endpoint for any errors or
+anomalies during this warmup period.
 
-1. Start the committer in normal mode and confirm it connects to the ordering
-   service and sidecar.
-2. Submit a test transaction and confirm it commits successfully.
-3. Verify the test transaction's state change is reflected in the database.
-4. Monitor the committer's Prometheus metrics (available on the monitoring
-   endpoint) for any errors or anomalies.
-5. Gradually migrate client applications from the Fabric Gateway/SDK to the
-   Fabric-X SDK or direct gRPC clients.
-6. After a sufficient burn-in period, decommission the Fabric infrastructure.
+Client applications can be migrated gradually from the Fabric Gateway/SDK to
+the Fabric-X SDK or direct gRPC clients — there's no reason to do it all at
+once. After the Fabric-X network has been running stably for a sufficient
+burn-in period, the Fabric infrastructure can be decommissioned. Don't do it
+earlier — having the original Fabric network intact is the safest rollback
+option you have.
 
 ## Multi-Channel Migration
 
@@ -1174,44 +1145,47 @@ operational preference. There is no dependency between channel migrations.
 # Rationale and alternatives
 [alternatives]: #alternatives
 
-- **Why snapshots over block replay?** Replaying the entire blockchain from
-  genesis would produce the same world state, but it would take orders of
-  magnitude longer for large ledgers. Snapshots give us the world state
-  directly, which is all that is needed. The tradeoff is that we lose
-  transaction history, but that history is preserved in the original Fabric
-  ledger and is not needed for Fabric-X to operate.
+Replaying the entire blockchain from genesis would produce the same world
+state, but for a large ledger it would take hours or days. Snapshots give us
+the world state directly — which is all we actually need to bootstrap
+Fabric-X — and the peer's snapshot feature has been stable and well-tested
+since Fabric 2.x. The tradeoff is that transaction history doesn't come across,
+but that history stays preserved in the original Fabric ledger and Fabric-X
+doesn't need it to operate.
 
-- **Why a separate CLI tool rather than embedding export in the committer?**
-  Embedding the export logic in the committer would couple it to Fabric's
-  protobuf definitions (specifically `fabric-protos-go-apiv2` and the
-  `SnapshotRecord` message type) and snapshot format. A separate tool keeps the
-  committer clean and allows the export tool to evolve independently. It also
-  makes it possible to run the export on a different machine from the
-  committer — for example, on the same machine as the Fabric peer, avoiding
-  the need to transfer large snapshot files over the network.
+The exporter is a standalone CLI rather than logic embedded in the committer
+because these two things have very different dependency profiles. The exporter
+needs Fabric's protobuf definitions (`fabric-protos-go-apiv2`, `SnapshotRecord`)
+to read snapshot files. The committer should not carry those. Keeping them
+separate also means the exporter can run on the same machine as the Fabric
+peer — avoiding the need to move large snapshot directories across the network
+— while the committer stays on its own machine. A coupled design would force
+one or the other to live in the wrong place.
 
-- **Why one-to-one channel mapping (Option 2) over key prefixing (Option 1)?**
-  See the detailed analysis in the Channel-to-Global State Mapping section.
-  In summary: Option 1 introduces namespace collision risks, requires
-  application modifications, breaks channel isolation guarantees, and adds
-  complexity — all for the theoretical benefit of consolidation that most
-  deployments do not need. Option 2 aligns with both Fabric's and Fabric-X's
-  architecture and requires no application changes.
+The one-to-one channel mapping (Option 2 over Option 1) is covered thoroughly
+in the Channel-to-Global State Mapping section, but the short version is this:
+key prefixing adds namespace collision risks, forces application code changes,
+destroys the isolation guarantees that channels were designed to provide, and
+adds complexity for a benefit — consolidation — that most deployments don't
+actually need. One-to-one mapping requires no application changes, carries
+over isolation naturally, and aligns with how both platforms model state.
 
-- **Why not use the Fabric Smart Client for migration?** The Fabric Smart
-  Client is designed for interactive transaction flows, not bulk data
-  migration. While it could theoretically be adapted, using it would add
-  significant complexity and dependencies. A purpose-built, single-purpose
-  tool is more appropriate and easier to test and maintain.
+The Fabric Smart Client was considered and ruled out for migration use.
+It's built for interactive transaction flows — multi-party protocols,
+peer-to-peer negotiation — not bulk state transfer. Adapting it would bring
+in significant dependencies and complexity. A purpose-built tool is simpler
+to test, simpler to audit, and simpler to maintain over time.
 
-- **Why not migrate transaction IDs?** See the dedicated Transaction ID History
-  section. The different transaction formats between Fabric and Fabric-X
-  prevent cross-platform replay attacks, making TX-ID migration unnecessary.
-  This position should be validated by a security review.
+Transaction ID migration is addressed in the dedicated section in the
+guide-level explanation and in the Security section. The reasoning is that
+Fabric and Fabric-X use incompatible transaction formats, so a Fabric
+transaction cannot survive the parsing stage in Fabric-X regardless of what
+the TX-ID history looks like. That reasoning warrants a formal security review
+before the feature is promoted to stable.
 
-Without this, the community will end up with a patchwork of one-off migration
-scripts — fragile, untested, and different for every deployment. That's not a
-good foundation for Fabric-X adoption.
+Without a standard migration path, the community will end up with a patchwork
+of one-off scripts — fragile, untested, and different for every deployment.
+That's not a foundation Fabric-X adoption can stand on.
 
 # Prior art
 [prior-art]: #prior-art
