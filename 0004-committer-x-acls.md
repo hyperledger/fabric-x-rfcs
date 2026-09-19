@@ -6,7 +6,7 @@ nav_order: 3
 
 - Feature Name: committer_x_acl_enforcement
 - Start Date: 2026-05-26
-- Fabric-X Component: committer-x (query service, block query service, block deliver, notification service)
+- Fabric-X Component: committer-x (query service, sidecar service)
 - Fabric-X Issue: https://github.com/hyperledger/fabric-x-committer/issues/592
 
 # Summary
