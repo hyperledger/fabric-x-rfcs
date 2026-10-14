@@ -14,7 +14,7 @@ nav_order: 3
 
 This RFC proposes an Access Control List (ACL) enforcement layer for the gRPC APIs exposed by Committer-X,
 built around a **dedicated, central Authentication & Authorization Service (`AuthService`)** that issues
-**certificate-bound JSON Web Tokens (JWTs)**.
+**certificate-bound opaque tokens**.
 
 Every exposed RPC is a resource; every resource maps to a channel policy that decides which client identities
 may invoke it. Policies and identities both come from the channel-configuration bundle — the single source of
@@ -25,10 +25,10 @@ The design separates **authentication** — a full MSP signature verification, p
 paid on every call but reduced to a token lookup and a policy evaluation:
 
 1. The client asks the `AuthService` for a **single-use nonce**.
-2. The client signs that nonce into a `common.Envelope` and presents it to `Authenticate`. The service verifies
-   the signature, consumes the nonce, binds the identity to the client's TLS certificate, persists the
-   token→identity record, and returns a JWT with a configurable TTL.
-3. On every subsequent RPC the client attaches only the **JWT** in gRPC metadata.
+2. The client signs that nonce into a `common.Envelope` and presents it to `Authenticate`. The service consumes
+   the nonce, verifies the signature, binds the identity to the client's TLS certificate, persists the
+   token→identity record, and returns an opaque token with a configurable TTL.
+3. On every subsequent RPC the client attaches only the **token** in gRPC metadata.
 4. The resource server forwards the token, the client's TLS certificate hash, and the resource name to
    `Authorize`. The `AuthService` resolves the identity, checks the binding and scope, evaluates the policy
    against the latest bundle, and answers. The RPC proceeds only on approval.
@@ -78,18 +78,19 @@ as `/Channel/Application/Readers`. Operators declare the mapping in `configtx.ya
 ```yaml
 ACLs:
   /committerpb.QueryService/GetTransactionStatus: /Channel/Application/Readers
-  /committerpb.BlockQueryService/GetBlockByNumber: /Channel/Application/Readers
+  /committerpb.SidecarService/GetBlockByNumber: /Channel/Application/Readers
 ```
 
 Resource servers hold **no signing keys and no MSP evaluation logic**. They shuttle a token and a resource name
 to the `AuthService` and honour its answer. Two runtime components:
 
 - **`AuthService`** — a standalone gRPC service that issues nonces, authenticates clients from a signed envelope
-  and mints cert-bound JWTs, and authorizes `(token, resource, cert hash)` on behalf of resource
+  and issues cert-bound opaque tokens, and authorizes `(token, resource, cert hash)` on behalf of resource
   servers. It holds the latest channel-configuration bundle and the persisted token→identity records.
 - **ACL interceptors** — one unary and one streaming interceptor installed on each exposed service (Query and
-  Sidecar services). They read the JWT from metadata and the caller's TLS certificate hash from the connection,
-  ask the `AuthService`, and run the handler only on approval.
+  Sidecar services). They read the token from metadata and the caller's TLS certificate hash from the connection,
+  ask the `AuthService`, and run the handler only on approval. Health checks are exempt, so probes keep working
+  once ACL is on.
 
 ## The end-to-end flow
 
@@ -167,11 +168,9 @@ of answer, and it would need its own contract to be meaningful.
 That leaves refusing those calls outright. It works, but it makes one token mean two different things depending
 on which method is used: filtered where namespaces are named, refused everywhere else.
 
-To support this feature we needs a decision, per
-method, about what a namespace even means for that method, and a default that refuses whenever the answer is
-unclear, so that a newly added RPC is never quietly left unprotected.
-
-
+To support this feature we need a decision, per method, about what a namespace even means for that method, and
+a default that refuses whenever the answer is unclear, so that a newly added RPC is never quietly left
+unprotected.
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
@@ -181,17 +180,20 @@ unclear, so that a newly added RPC is never quietly left unprotected.
 1. **`AuthService`** — a standalone gRPC service exposing three RPCs:
     - `IssueNonce() → nonce, expires_at`
     - `Authenticate(signed_envelope, requested_scope) → token, expires_at`
-    - `Authorize(token, resource, tls_cert_hash) → authorized, token_expires_at`
+    - `Authorize(token, resource, tls_cert_hash) → token_expires_at`
 
    It maintains the latest `channelconfig.Bundle` (refreshed in the background), a persisted token-record store
-   keyed by `jti`, a persisted nonce store, and the signing key used to mint and verify JWTs. Because only the
-   `AuthService` verifies tokens, the key never leaves it.
+   and a persisted nonce store. It holds **no signing key**: a token is a random secret that only the
+   `AuthService` can resolve (see [The token](#the-token)).
 
-   `Authorize` returns only a decision and the bound token's expiry. It deliberately does **not** return the
-   resolved identity.
+   `Authorize` returns the bound token's expiry on approval and an error status otherwise. It deliberately does
+   **not** return the resolved identity.
+
+   `IssueNonce` and `Authenticate` are the only RPCs reachable without a token, so they are rate-limited
+   separately from the rest of the service.
 
 2. **ACL interceptors** on Query and Sidecar: read the token from metadata, read the TLS cert hash from
-   the connection, call `Authorize`, map the answer to `OK` / `PermissionDenied` / `Unauthenticated` /
+   the connection, call `Authorize`, and return its answer as `OK` / `PermissionDenied` / `Unauthenticated` /
    `Unavailable`. They never inspect the request body.
 
 3. **The state database** — the PostgreSQL/YugabyteDB the committer already uses. It holds the committed
@@ -202,7 +204,7 @@ unclear, so that a newly added RPC is never quietly left unprotected.
 A timestamp freshness window bounds *how long* a captured envelope stays useful; it does not make replay
 impossible. The nonce does.
 
-`IssueNonce` returns 32 bytes value with a short TTL. The client places it in the envelope's
+`IssueNonce` returns a 32-byte value with a short TTL. The client places it in the envelope's
 **`SignatureHeader.Nonce`** — Fabric's canonical nonce field, and part of the marshaled payload the signature
 covers, so it cannot be substituted without invalidating the signature. `Authenticate` **consumes** the nonce.
 
@@ -212,31 +214,25 @@ Three consequences worth stating explicitly:
   has no guarantee its `IssueNonce` and `Authenticate` calls reach the same instance. Consumption is a single
   conditional delete (`WHERE nonce = $1 AND expires_at >= $2`), so it is atomic and expiry-checked even when two
   instances race on the same nonce: exactly one delete affects a row.
-- The nonce is redeemed **before** signature verification, so a replayed envelope cannot make the service repeat
-  the expensive identity extraction and evaluation work.
-- Because redemption precedes verification, **a nonce is burned by any failed `Authenticate`**, including one
-  that fails for a benign reason such as a clock skew or a malformed envelope. A client that gets an error must
-  call `IssueNonce` again before retrying; retrying with the same envelope will always fail. Unredeemed nonces
-  are swept on the same interval as expired tokens.
+- The nonce is redeemed **before** any other check, including signature verification, so a replayed envelope
+  cannot make the service repeat the expensive identity extraction and evaluation work.
+- Because redemption comes first, **a nonce is burned by any failed `Authenticate`**, including one that fails
+  for a benign reason such as clock skew. A client that gets an error must call `IssueNonce` again before
+  retrying; retrying with the same envelope will always fail. Unredeemed nonces are swept on the same interval
+  as expired tokens.
 
 ## The token
+[the-token]: #the-token
 
-A JWT minted and verified only by the `AuthService`, certificate-bound in the style of RFC 8705: the
-`cnf` claim carries the SHA-256 of the client's TLS certificate, so the token is useless to a caller
-that cannot present the matching certificate.
+An opaque random value that carries **no claims**: it is a key into the token store and nothing more.
 
-```
-{
-  "iss": "committer-x-auth",
-  "sub": "<mspID>",
-  "jti": "<opaque token id>",                // key into the persisted record
-  "iat": <unix seconds>,
-  "exp": <unix seconds>,                     // short TTL, e.g. 5m
-  "cnf": { "x5t#S256": "<base64url(sha256(client TLS cert))>" },
-  "scope": ["/committerpb.QueryService/GetRows"],
-  "seq":  <config sequence at issuance>
-}
-```
+It needs no signature. Only the `AuthService` resolves tokens, and always through the store: a token that was
+never issued has no record, and a random value of this size cannot be guessed, so a record's existence is the
+proof that the `AuthService` issued it. The store holds a hash of the token rather than the token itself, so
+reading the database yields nothing a client could present.
+
+The token is certificate-bound in the style of RFC 8705: its record holds the hash of the client's TLS
+certificate, so the token is useless to a caller that cannot present the matching certificate.
 
 ### Why token→identity, not token→permissions
 
@@ -254,29 +250,27 @@ moment it is swapped in.
 ### Token lifetime and revocation
 
 **A token cannot be revoked. It is valid until it expires.** `token-ttl` (default 5m) is the only control: it is
-the longest a stolen token, or an identity that has lost its channel authority, stays usable. Shorten it if that
-window is too wide.
-
+the longest a stolen token stays usable. Shorten it if that window is too wide.
 
 ## Authentication (`Authenticate`)
 
 Steps 1–3 of the diagram. The envelope carries the client's serialized MSP signing identity, a signature over
 the payload, and — in its `ChannelHeader` — a `Timestamp` and, under mTLS, a `TlsCertHash`. The handler:
 
-1. **Scope.** The envelope must really be an authentication request for this channel: the expected header type,
+1. **Nonce.** Consumed as described above; failure is `Unauthenticated`.
+2. **Scope.** The envelope must really be an authentication request for this channel: the expected header type,
    a matching channel id, and **no payload data**. These are *scoping* checks — they pin down what an
    authentication envelope is, so that something the client signed for another purpose cannot be handed in as
    one.
-2. **Freshness.** `Timestamp` must fall within the configured window. Compared as signed bounds, not as an
+3. **Freshness.** `Timestamp` must fall within the configured window. Compared as signed bounds, not as an
    absolute difference, so a far-future timestamp cannot overflow the arithmetic and be accepted indefinitely.
-3. **Nonce.** Consumed as described above; failure is `Unauthenticated`.
 4. **Certificate binding.** Under mTLS the claimed `TlsCertHash` must equal the hash of the connection's
-   certificate (`util.ExtractCertificateHashFromContext`). Without a client certificate the token is not
-   certificate-bound — see [Mutual TLS](#mutual-tls-is-required).
+   certificate. Without a client certificate the token is not certificate-bound — see
+   [Mutual TLS](#mutual-tls-is-required).
 5. **Identity.** Deserialized and **validated** against the bundle's `MSPManager()`, and the signature
    verified, proving possession of the private key.
-6. **Mint and record.** A `jti` is generated, the JWT is signed over it, and the record is persisted under it -
-   in that order, so a failure at either step leaves neither a usable token nor an orphan row.
+6. **Issue and record.** A random token is generated and its record persisted. The token is returned only after
+   its record is stored, so a failure leaves no usable token.
 
 The requested scope is an ordinary request field and is not covered by the envelope signature. This is safe
 because a scope can only *narrow* authority: the worst outcome of tampering is a token weaker than the client
@@ -285,12 +279,12 @@ asked for, never stronger.
 ## Authorization (`Authorize`)
 
 Steps 4–6. On the **resource server**, the interceptor reads the token from metadata and the certificate hash
-from its own connection, then calls `Authorize` and maps the result.
+from its own connection, then calls `Authorize` and returns its answer.
 
 On the **`AuthService`**, `Authorize`:
 
-1. verifies the JWT signature, algorithm, issuer, and expiry;
-2. loads the record by `jti` (unknown → `Unauthenticated`);
+1. loads the token's record (unknown → `Unauthenticated`);
+2. checks the record's expiry;
 3. checks the certificate binding against the hash observed at the resource server, so a leaked token cannot be
    replayed from another connection;
 4. checks the resource against the token's resource scope;
@@ -301,9 +295,8 @@ On the **`AuthService`**, `Authorize`:
    `policy.EvaluateIdentities([]msp.Identity{identity})`.
 
 `Authorize` is intended for resource servers. A client that calls it directly learns only whether a token it
-already holds would be permitted on a resource — the decision is a boolean returned to the caller and confers no
-access, because the resource server derives the certificate hash from *its own* connection, not from anything
-the client asserts.
+already holds would be permitted on a resource — the answer confers no access, because the resource server
+derives the certificate hash from *its own* connection, not from anything the client asserts.
 
 ## Streaming authorization
 [streaming-authorization]: #streaming-authorization
@@ -315,15 +308,15 @@ Binding the token rather than the identity alone is what makes **token expiry** 
 re-presenting the token forces the `AuthService` to resolve it to its record before evaluating policy, so a
 lapsed token denies the stream exactly as a policy change does. An identity-only re-check would see neither.
 
-A decision is reused until it lapses, which is `min(stream-revalidate-interval, token expiry)`:
+A decision is reused until it lapses, which is `min(stream-re-authorize-interval, token expiry)`:
 
 | Situation | Behaviour |
 |---|---|
-| **Establishment** | Full `Authorize` round-trip. The decision and the token's expiry are cached on the session. |
+| **Establishment** | Full `Authorize` round-trip. The token's expiry is cached on the session. |
 | **Decision still valid** | No round-trip; the message proceeds. This is the common case, so `AuthService` latency stays off the data path — a check on *every* message would add a round-trip per block and per batch. |
 | **Decision lapsed** | The next receive or send re-authorizes with the token. Expiry and policy changes are both caught here. |
 | **Token expired** | Denied **locally**, with no round-trip: the bound token is known to be dead, so no outage can extend a stream past the life of the token that established it. |
-| **`AuthService` briefly unreachable** | An established stream keeps serving and retries on a bounded interval rather than failing on a transient blip. The bound token's expiry still caps how long this can continue, so an outage cannot extend a stream past its token. |
+| **Re-authorization fails** (policy denial, or `AuthService` unreachable) | **Fails closed**: the stream is terminated. The client reconnects with a live token, and the new stream is admitted once the `AuthService` answers again. |
 
 ### Stream lifetime is the token lifetime
 
@@ -332,24 +325,22 @@ stream**: gRPC metadata is fixed at stream establishment, so the wrapper re-pres
 When that token expires the stream is denied on its next message with `Unauthenticated`.
 
 Clients must therefore expect a stream to end roughly every `token-ttl` and reconnect with a fresh token,
-resuming from their last processed position — `peer.Deliver` via its seek position, `StreamAllTransactions` from
-the last received block number. Operators running long-lived subscriptions should raise `token-ttl`, accepting
-the longer exposure window that implies, since TTL is also the only bound on a compromised token.
+resuming from their last processed position — `peer.Deliver` via its seek position; for streams without a start
+position, by fetching any missed blocks by number. Operators running long-lived subscriptions should raise
+`token-ttl`, accepting the longer exposure window that implies, since TTL is also the only bound on a
+compromised token.
 
 ## Persistence & recovery
 [persistence--recovery]: #persistence--recovery
 
-If token→identity records lived only in memory, a restart or failover would invalidate every token and force all clients to re-authenticate. They are therefore **persisted in the state database**.
+If token→identity records lived only in memory, a restart or failover would invalidate every token and force all clients to re-authenticate. They are therefore **persisted in the state database**, keyed by a hash of the token.
 
-```go
-type TokenRecord struct {
-    JTI            string          // token id (row key)
-    Identity       *msppb.Identity // MSP identity, re-resolved against the latest bundle
-    MSPID          string
-    CertHashSHA256 []byte          // cnf/x5t#S256 binding
-    Scope          []string        // optional resource scope
-    IssuedSequence uint64          // config sequence at issuance
-    ExpiresAt      int64           // unix seconds, for TTL sweep
+```
+TokenRecord {
+    Identity        // MSP identity, re-resolved against the latest bundle
+    CertHashSHA256  // binding to the client's TLS certificate
+    Scope           // optional resource scope
+    ExpiresAt       // checked on every Authorize, used by the TTL sweep
 }
 ```
 
@@ -360,26 +351,68 @@ They deliberately do **not** follow the `ns_<id>` state-namespace scheme: this i
 committer world state, and conflating the two would expose it to namespace tooling and policy that does not
 apply to it.
 
-On startup the service warms an in-memory cache of unexpired records so recently issued tokens resolve without a
-round-trip. A background sweep deletes lapsed rows and evicts them from the cache.
+There is no **in-memory cache**: every lookup reads the store, until profiling shows that read matters. A
+background sweep deletes lapsed token and nonce rows.
 
-Since every instance reads the same rows, the design is stateless from the resource server's perspective and
-horizontally scalable: any `AuthService` instance can authorize any token (if they have the same key).
+### Scalability
+
+Since every instance reads the same rows and instances share no key material, the design is stateless from the
+resource server's perspective and horizontally scalable: any `AuthService` instance can serve any request.
+A client's calls are spread across instances by its load-balancing gRPC connection, so its `IssueNonce` and
+`Authenticate` may well land on different instances. Resource servers reach the `AuthService` the same way,
+balancing their `Authorize` calls across every instance. All of this is safe because the nonce, the token
+record and the configuration live in the shared, sharded state database rather than on any one instance.
+Adding capacity means adding instances, with no coordination between them.
+
+```mermaid
+flowchart LR
+    subgraph C[Client]
+        App[Client application] --> CLB[Load-balancing<br/>gRPC connection]
+    end
+
+    subgraph RS[Resource servers]
+        Q[Query service] --> RLB[Load-balancing<br/>gRPC connection]
+        SC[Sidecar] --> RLB
+    end
+
+    App -->|RPC + token| Q
+    App -->|RPC + token| SC
+
+    subgraph AS[AuthService instances]
+        AS1[AuthService 1]
+        AS2[AuthService 2]
+        AS3[AuthService N]
+    end
+
+    CLB -->|IssueNonce| AS1
+    CLB -->|Authenticate| AS2
+    RLB -->|Authorize| AS
+
+    subgraph DB[Shared state database - PostgreSQL / YugabyteDB]
+        S1[(Shard 1)]
+        S2[(Shard 2)]
+        S3[(Shard N)]
+    end
+
+    AS1 --> DB
+    AS2 --> DB
+    AS3 --> DB
+```
 
 ## Bundle refresh
 
 ACL evaluation needs MSP and policy definitions, which come from the channel-configuration bundle. The
 `AuthService` reads it **from the state database**, reusing the mechanism the query service already uses: read
-the configuration envelope from the config namespace (`applicationpb.ConfigTransaction{Envelope, Version}`) and
-build a `channelconfig.Bundle` via `channelconfig.NewBundleFromEnvelope`. A background goroutine polls on a
-configurable interval and atomically swaps the bundle **only when the version strictly advances**.
+the configuration envelope from the config namespace and build a `channelconfig.Bundle` from it. A background
+goroutine polls on a configurable interval and atomically swaps the bundle **only when the version strictly
+advances**.
 
 **A failed refresh does not fail closed.** The error is logged and retried on the next tick, and the service
-keeps authorizing against the last bundle it loaded. This is a deliberate choice, and it matches the sidecar and
-query service, whose TLS Root CAs refresh from the same table behaves the same way: it rests on the state database
-being highly available, and it prefers continued availability over rejecting every RPC during a transient
-database problem.
-The consequence is that a prolonged database outage leaves policy stale.
+keeps authorizing against the last bundle it loaded, as the sidecar and query service do for their TLS Root CAs.
+
+A prolonged database outage, however, does fail closed: every `Authorize` reads the token store, so once that
+read fails, protected calls are rejected with `Unavailable`. The design rests on the state database being
+highly available.
 
 ## Bootstrap
 
@@ -397,36 +430,35 @@ configuration block, nothing useful is exposed before enforcement is active.
 The certificate binding *is* the token's proof-of-possession property, and it follows entirely from the
 transport: mutual TLS puts the client's certificate on the connection and the service binds to it.
 
-Choosing anything other than `mtls` is choosing bearer tokens. This is an accepted mode, not a defect, but
-it is a security decision that belongs to whoever writes the configuration. Under it, `token-ttl` is the only
-thing bounding a captured token, which is a further reason to keep it short.
+Deploy the `AuthService` and every ACL-protected resource server with `mtls`. Anything else means bearer
+tokens: the token is not certificate-bound, and anyone who captures it can replay it until `token-ttl` expires.
+The non-mTLS mode exists for local development and tests only, and must not be used in production.
 
 ## Configuration
 
-Default resource-to-policy mappings live in code. Operator-visible mappings live in `configtx.yaml` under
-`ACLs`. Lookup order: the bundle's `ACLs` section, then the default map; if neither defines the resource, the
-request is denied.
+Default resource-to-policy mappings live in code: every exposed method maps to `/Channel/Application/Readers`.
+Operator-visible mappings live in `configtx.yaml` under `ACLs`. Lookup order: the bundle's `ACLs` section, then
+the default map; if neither defines the resource, the request is denied.
 
-- **`AuthService`**: signing key path (shared across instances; an ephemeral key is generated when empty, which
-  suits only a single-instance dev deployment), token TTL, envelope freshness window, nonce TTL, config-refresh
-  interval, token-cleanup interval, and the database connection.
-- **Resource services (Query, Sidecar)**: an optional `auth:` section carrying the `AuthService` endpoint and
-  its TLS settings, plus an optional stream re-validation interval.
+- **`AuthService`**: token TTL, nonce TTL, envelope freshness window, config-refresh interval, cleanup
+  interval, the rate limit on the unauthenticated RPCs, and the database connection.
+- **Resource services (Query, Sidecar)**: an optional `auth:` section listing the `AuthService` instances and
+  their TLS settings, plus an optional stream re-authorization interval and authorization timeout.
 
-**Omitting `auth:` disables ACL enforcement for that service.** The section is an optional pointer with no
-defaults, so an operator who leaves it out gets a service that installs no interceptors, opens no connection to
-the `AuthService`, and behaves exactly as it does today.
+**Omitting `auth:` disables ACL enforcement for that service.** An operator who leaves it out gets a service
+that installs no interceptors, opens no connection to the `AuthService`, and behaves exactly as it does today.
 
 # Prior art
 [prior-art]: #prior-art
 
-**OAuth 2.0.** The `AuthService` is the authorization server, the JWT the access token, Query and Sidecar the
-resource servers: authenticate once centrally for a short-lived scoped token, then access resources many times
-with it.
+**OAuth 2.0.** The `AuthService` is the authorization server, the opaque token the access token, Query and
+Sidecar the resource servers: authenticate once centrally for a short-lived scoped token, then access resources
+many times with it.
 
-**RFC 8705 (Mutual-TLS Certificate-Bound Access Tokens).** The `cnf.x5t#S256` claim makes the token a
-proof-of-possession credential, which is what makes it safe to carry in metadata instead of re-sending a signed
-envelope. The nonce challenge closes the remaining replay window on the *authentication* step itself.
+**RFC 8705 (Mutual-TLS Certificate-Bound Access Tokens).** Binding the token to the client's TLS certificate
+makes it a proof-of-possession credential, which is what makes it safe to carry in metadata instead of
+re-sending a signed envelope. RFC 8705 carries the binding in a `cnf` claim; here it lives in the server-side
+record. The nonce challenge closes the remaining replay window on the *authentication* step itself.
 
 **RFC 7662 (Token Introspection).** The model in which a resource server consults an authorization server about
 a token it cannot itself interpret. This design is that model: the resource server never inspects the token, and
@@ -448,6 +480,10 @@ how often* the identity is verified: Fabric verifies a signature on every call; 
   with no new critical service — but it pays a full signature verification on *every* request and offers no
   scoped tokens. Should per-call verification cost prove negligible and operational simplicity dominate, this
   remains the natural fallback.
+- **Signed token (JWT).** Rejected for this iteration. A signature only helps a verifier that cannot consult the
+  store, and here the only verifier is the `AuthService`, which always does. It would add a signing key every
+  instance must share and rotate, without removing any per-call work: the identity must be re-resolved against
+  the latest bundle either way. Worth revisiting only if resource servers are meant to authorize locally.
 - **Folding authentication into an existing service** (e.g. the query service). Delayed: it remains
   a reasonable option and is open for discussion as future work. A standalone `AuthService` is the starting
   point because authenticating clients and serving data are separate responsibilities, and keeping them apart
@@ -457,10 +493,9 @@ how often* the identity is verified: Fabric verifies a signature on every call; 
 [dependencies]: #dependencies
 
 - MSP, policy, and channel-configuration packages from `fabric-x-common` (`protoutil`, `msp`, `policies`,
-  `channelconfig.NewBundleFromEnvelope`).
-- `protoutil.EnvelopeAsSignedData`, `protoutil.MakeSignatureHeader`, and
-  `util.ExtractCertificateHashFromContext` from `fabric-x-common`.
-- A JWT library for ES256 minting/verification with `cnf`/`x5t#S256` and claims validation.
+  `channelconfig`).
+- Envelope signing and TLS certificate hashing helpers from `fabric-x-common`, including a new helper for
+  signing the server-issued nonce into the `SignatureHeader`.
 - A new `AuthService` proto (`IssueNonce`/`Authenticate`/`Authorize`) and a new service binary on the existing
   `serve` lifecycle.
 - `sampleconfig/configtx.yaml` in `fabric-x-common` for a sample `ACLs` section.
